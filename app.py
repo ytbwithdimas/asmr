@@ -6,6 +6,7 @@ import threading
 import datetime
 import subprocess
 import shutil
+import re
 import pandas as pd
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
@@ -13,15 +14,15 @@ from google.auth.transport.requests import Request
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
 import imageio_ffmpeg
-ffmpeg_path = imageio_ffmpeg.get_ffmpeg_exe()
 
+# Setup FFmpeg Path
+ffmpeg_path = imageio_ffmpeg.get_ffmpeg_exe()
 os.environ["IMAGEIO_FFMPEG_EXE"] = ffmpeg_path
 
 # ==========================================
 # CONFIGURATION & SETUP
 # ==========================================
-# Update DB name to force schema refresh
-DB_FILE = "asmr_automator_v6.db" 
+DB_FILE = "asmr_automator_v7_pro.db" 
 UPLOAD_DIR = "uploads"
 OUTPUT_DIR = "outputs"
 SECRETS_FILE = "client_secrets.json"
@@ -33,12 +34,13 @@ os.makedirs(UPLOAD_DIR, exist_ok=True)
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 # Page Config
-st.set_page_config(page_title="ASMR Engine V7", layout="wide", page_icon="🌙")
+st.set_page_config(page_title="ASMR Engine V7 Pro", layout="wide", page_icon="🌙")
 
 # ==========================================
 # DATABASE LAYER (SQLite)
 # ==========================================
 def init_db():
+    """Inisialisasi Database dengan kolom Progress & ETA"""
     conn = sqlite3.connect(DB_FILE, check_same_thread=False)
     c = conn.cursor()
     c.execute('''
@@ -58,9 +60,19 @@ def init_db():
             output_path TEXT,
             logs TEXT DEFAULT '',
             watermark_mode TEXT DEFAULT 'none', 
-            mute_original INTEGER DEFAULT 1
+            mute_original INTEGER DEFAULT 1,
+            progress INTEGER DEFAULT 0,
+            eta_text TEXT DEFAULT '--:--'
         )
     ''')
+    
+    # Migrasi otomatis untuk user lama (menambah kolom jika belum ada)
+    try:
+        c.execute("ALTER TABLE jobs ADD COLUMN progress INTEGER DEFAULT 0")
+        c.execute("ALTER TABLE jobs ADD COLUMN eta_text TEXT DEFAULT '--:--'")
+    except sqlite3.OperationalError:
+        pass # Kolom sudah ada
+        
     conn.commit()
     conn.close()
 
@@ -70,8 +82,8 @@ def add_job(v_path, a_path, crossfade, hours, title, desc, tags, scheduled_at, w
     mute_val = 1 if mute_original else 0
     
     c.execute('''
-        INSERT INTO jobs (video_path, audio_path, crossfade_sec, duration_hours, title, description, tags, scheduled_at, status_render, status_upload, watermark_mode, mute_original)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', 'idle', ?, ?)
+        INSERT INTO jobs (video_path, audio_path, crossfade_sec, duration_hours, title, description, tags, scheduled_at, status_render, status_upload, watermark_mode, mute_original, progress, eta_text)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', 'idle', ?, ?, 0, 'Waiting...')
     ''', (v_path, a_path, crossfade, hours, title, desc, tags, scheduled_at, watermark_mode, mute_val))
     job_id = c.lastrowid
     conn.commit()
@@ -111,6 +123,14 @@ def update_job_status(job_id, render_status=None, upload_status=None, output_pat
         query = f"UPDATE jobs SET {', '.join(updates)} WHERE id = ?"
         c.execute(query, tuple(params))
         conn.commit()
+    conn.close()
+
+def update_job_progress(job_id, progress_percent, eta_msg):
+    """Fungsi khusus untuk update bar progress secara efisien"""
+    conn = sqlite3.connect(DB_FILE, check_same_thread=False)
+    c = conn.cursor()
+    c.execute("UPDATE jobs SET progress = ?, eta_text = ? WHERE id = ?", (progress_percent, eta_msg, job_id))
+    conn.commit()
     conn.close()
 
 def get_jobs_df():
@@ -161,7 +181,8 @@ def get_authenticated_service():
             token.write(creds.to_json())
     return build('youtube', 'v3', credentials=creds)
 
-def upload_video_to_youtube(file_path, title, description, tags, category_id="22"):
+def upload_video_to_youtube(job_id, file_path, title, description, tags, category_id="22"):
+    """Mengupload video dengan Progress Tracking"""
     try:
         youtube = get_authenticated_service()
         body = {
@@ -173,18 +194,26 @@ def upload_video_to_youtube(file_path, title, description, tags, category_id="22
                 'privacyStatus': 'private', 'selfDeclaredMadeForKids': False,
             }
         }
-        media = MediaFileUpload(file_path, chunksize=-1, resumable=True)
+        
+        # Chunksize 4MB agar progress bar bergerak halus
+        chunk_size = 4 * 1024 * 1024 
+        media = MediaFileUpload(file_path, chunksize=chunk_size, resumable=True)
         request = youtube.videos().insert(part=','.join(body.keys()), body=body, media_body=media)
+        
         response = None
         while response is None:
             status, response = request.next_chunk()
-            if status: print(f"Uploaded {int(status.progress() * 100)}%")
+            if status:
+                prog = int(status.progress() * 100)
+                update_job_progress(job_id, prog, "☁️ Uploading to YouTube...")
+        
+        update_job_progress(job_id, 100, "✅ Upload Complete")
         return response['id']
     except Exception as e:
         raise e
 
 # ==========================================
-# FFmpeg PROCESSING ENGINE
+# FFmpeg PROCESSING ENGINE (WITH ETA)
 # ==========================================
 def check_nvidia_gpu():
     try:
@@ -208,27 +237,25 @@ def process_asmr_video(job_id, video_path, audio_path, duration_hours, watermark
             preset = "ultrafast"
             encoding_msg = "🐢 No GPU detected (CPU)."
 
-        update_job_status(job_id, render_status="rendering", log_msg=f"1. Starting Immediate Render... {encoding_msg}")
+        update_job_status(job_id, render_status="rendering", log_msg=f"1. Starting Render... {encoding_msg}")
         
         target_duration_sec = int(duration_hours * 3600)
         filename = f"asmr_{job_id}_{int(time.time())}.mp4"
         output_full_path = os.path.join(OUTPUT_DIR, filename)
         
+        # Build Command
         cmd = ["ffmpeg", "-y"]
         cmd.extend(["-stream_loop", "-1", "-i", video_path])
         cmd.extend(["-stream_loop", "-1", "-i", audio_path])
         
-        # --- WATERMARK REMOVAL LOGIC ---
+        # Watermark Logic
         video_filters = []
         if watermark_mode == 'crop_only':
             video_filters.append("crop=in_w:in_h-86:0:0")
-            update_job_status(job_id, log_msg="Mode: CROP ONLY. Cutting bottom 86px.")
         elif watermark_mode == 'blur':
             video_filters.append("delogo=x=0:y=h-86:w=w:h=86")
-            update_job_status(job_id, log_msg="Mode: BLUR. Blurring bottom 86px.")
         elif watermark_mode == 'zoom_tl':
             video_filters.append("crop=in_w-150:in_h-86:0:0,scale=1920:1080:flags=lanczos")
-            update_job_status(job_id, log_msg="Mode: ZOOM TOP-LEFT. Cropping bottom-right and rescaling to 1080p.")
 
         if video_filters:
             cmd.extend(["-vf", ",".join(video_filters)])
@@ -245,17 +272,48 @@ def process_asmr_video(job_id, video_path, audio_path, duration_hours, watermark
             output_full_path
         ])
         
-        process = subprocess.run(cmd, capture_output=True, text=True)
+        # --- EXECUTE WITH REAL-TIME MONITORING ---
+        start_time = time.time()
+        process = subprocess.Popen(cmd, stderr=subprocess.PIPE, universal_newlines=True)
+        
+        # Regex to catch: time=00:00:05.12
+        time_pattern = re.compile(r"time=(\d{2}):(\d{2}):(\d{2})\.\d{2}")
+        
+        for line in process.stderr:
+            match = time_pattern.search(line)
+            if match:
+                h, m, s = map(int, match.groups())
+                current_sec = h * 3600 + m * 60 + s
+                
+                # 1. Calculate Progress %
+                progress = min(int((current_sec / target_duration_sec) * 100), 99)
+                
+                # 2. Calculate ETA
+                elapsed = time.time() - start_time
+                if current_sec > 0:
+                    speed = current_sec / elapsed # video seconds processed per real second
+                    remaining_sec = (target_duration_sec - current_sec) / speed
+                    
+                    eta_time = datetime.datetime.now() + datetime.timedelta(seconds=remaining_sec)
+                    eta_str = eta_time.strftime("%H:%M:%S")
+                    eta_msg = f"Selesai jam {eta_str} (Speed: {speed:.1f}x)"
+                    
+                    # Update DB (avoid flooding, strictly simple logic here)
+                    update_job_progress(job_id, progress, eta_msg)
+        
+        process.wait()
         
         if process.returncode != 0:
-            raise Exception(f"FFmpeg Error: {process.stderr}")
+            raise Exception(f"FFmpeg returned error code {process.returncode}")
             
+        # Final Success State
+        update_job_progress(job_id, 100, "✅ Render Done")
         update_job_status(
             job_id, 
             render_status="success", 
             upload_status="waiting_schedule",
             output_path=output_full_path, 
-            log_msg="2. Render Finished. Now Waiting for Schedule Time..."
+            log_msg="2. Render Finished. Waiting for schedule."
         )
         
     except Exception as e:
@@ -276,7 +334,9 @@ def scheduler_loop():
                 if current_time >= scheduled_time:
                     update_job_status(job['id'], upload_status="uploading", log_msg="3. Schedule Reached. Uploading...")
                     try:
+                        # Call upload with job_id for progress tracking
                         vid_id = upload_video_to_youtube(
+                            job['id'],
                             job['output_path'], job['title'], job['description'], job['tags']
                         )
                         update_job_status(job['id'], upload_status="success", youtube_id=vid_id, log_msg=f"4. Upload Success! ID: {vid_id}")
@@ -284,6 +344,7 @@ def scheduler_loop():
                         update_job_status(job['id'], upload_status="failed", log_msg=f"Upload Failed: {str(e)}")
             time.sleep(20)
         except Exception as e:
+            print(f"Scheduler Error: {e}")
             time.sleep(20)
 
 @st.cache_resource
@@ -302,10 +363,8 @@ def ui_upload_tab():
     st.header("1. Create, Render & Schedule")
     has_gpu = check_nvidia_gpu()
     if has_gpu: st.success("✅ NVIDIA GPU Detected")
-    else: st.warning("⚠️ No GPU Detected (CPU Mode)")
+    else: st.warning("⚠️ No GPU Detected (CPU Mode - Slower)")
 
-    # --- FIX: Session State for Time Picker ---
-    # Ini mencegah jam reset setiap kali ada interaksi UI
     if 'default_schedule_time' not in st.session_state:
         st.session_state.default_schedule_time = datetime.datetime.now().time()
 
@@ -328,11 +387,11 @@ def ui_upload_tab():
             index=1
         )
         if watermark_mode == "zoom_tl":
-            st.caption("ℹ️ *Crop kanan-bawah, lalu zoom agar Full HD.*")
+            st.caption("ℹ️ *Crop bottom-right, then resize to 1080p.*")
 
-        remove_audio = st.toggle("🔇 Hapus Audio Bawaan Video", value=True)
+        remove_audio = st.toggle("🔇 Mute Original Video Audio", value=True)
         st.markdown("---")
-        duration = st.number_input("Duration (Hours)", 0.1, 24.0, 1.0, 0.5)
+        duration = st.number_input("Duration (Hours)", 0.1, 24.0, 1.0, 0.1)
 
     with col2:
         st.subheader("Metadata")
@@ -344,8 +403,6 @@ def ui_upload_tab():
         st.write("**Set Upload Schedule**")
         c_d, c_t = st.columns(2)
         s_date = c_d.date_input("Date", datetime.date.today())
-        
-        # Gunakan session_state untuk default value
         s_time = c_t.time_input("Time", value=st.session_state.default_schedule_time)
 
     if st.button("🚀 Render Now (Upload Later)", type="primary"):
@@ -355,78 +412,123 @@ def ui_upload_tab():
             with open(v_path, "wb") as f: f.write(uploaded_video.getbuffer())
             with open(a_path, "wb") as f: f.write(uploaded_audio.getbuffer())
             
-            # Combine Date and Time
             s_dt = datetime.datetime.combine(s_date, s_time)
             
             job_id = add_job(v_path, a_path, 0, duration, title, desc, tags, s_dt, watermark_mode, remove_audio)
+            
+            # Run processing in thread
             t = threading.Thread(target=process_asmr_video, args=(job_id, v_path, a_path, duration, watermark_mode, remove_audio))
             t.start()
             
-            st.success(f"Job #{job_id} Started! Rendering now. Upload scheduled at {s_dt}.")
+            st.success(f"Job #{job_id} Started! Go to 'Manage' tab to see progress.")
         else:
-            st.error("Upload files first.")
+            st.error("Please upload files first.")
 
 def ui_manager_tab():
     st.header("Status Manager")
-    if st.button("🔄 Refresh Data"): st.rerun()
     
+    col_btn, col_info = st.columns([1, 4])
+    with col_btn:
+        if st.button("🔄 Refresh Status", use_container_width=True):
+            st.rerun()
+    with col_info:
+        st.caption("Klik refresh untuk memperbarui progress bar secara manual.")
+
     df = get_jobs_df()
     if not df.empty:
-        st.dataframe(df[['id', 'title', 'status_render', 'status_upload', 'scheduled_at']], use_container_width=True, hide_index=True)
+        # Tampilkan tabel utama
+        st.dataframe(
+            df[['id', 'title', 'status_render', 'status_upload', 'scheduled_at']], 
+            use_container_width=True, 
+            hide_index=True
+        )
         st.divider()
         
-        st.subheader("🔎 Job Details")
+        st.subheader("🔎 Job Monitor & Details")
         sel_id = st.selectbox("Select Job ID to view:", df['id'].tolist())
         
         if sel_id:
             job = df[df['id'] == sel_id].iloc[0]
-            c1, c2, c3 = st.columns([1, 1, 1])
             
-            with c1:
-                st.write("#### Monitor")
-                r_status = job['status_render']
-                u_status = job['status_upload']
-                
-                if r_status == 'success': st.success(f"Render: ✅ DONE")
-                elif r_status == 'rendering': st.warning(f"Render: ⚙️ PROCESSING...")
-                elif r_status == 'failed': st.error(f"Render: ❌ FAILED")
-                else: st.info(f"Render: {r_status}")
-                
-                if u_status == 'success': st.success(f"Upload: ✅ DONE")
-                elif u_status == 'uploading': st.warning(f"Upload: ☁️ UPLOADING...")
-                elif u_status == 'waiting_schedule': 
-                    st.info(f"Upload: ⏳ WAITING SCHEDULE")
-                    st.caption(f"At: {job['scheduled_at']}")
-                elif u_status == 'failed': st.error(f"Upload: ❌ FAILED")
-                else: st.write(f"Upload: ⏸️ Idle")
+            # === LOGIKA DUAL PROGRESS BAR ===
+            
+            # 1. Bersihkan nilai Raw dari Database (Agar tidak error)
+            raw_db_progress = job['progress']
+            try:
+                db_progress = int(raw_db_progress)
+            except (ValueError, TypeError):
+                db_progress = 0
+            
+            # Clamping 0-100
+            db_progress = max(0, min(100, db_progress))
 
-                st.markdown("---")
-                st.write("📂 **Source Files**")
+            # 2. Tentukan Nilai Render Bar
+            render_val = 0
+            if job['status_render'] == 'success':
+                render_val = 100
+            elif job['status_render'] == 'rendering':
+                render_val = db_progress
+            
+            # 3. Tentukan Nilai Upload Bar
+            upload_val = 0
+            if job['status_upload'] == 'success':
+                upload_val = 100
+            elif job['status_upload'] == 'uploading':
+                upload_val = db_progress
+            elif job['status_upload'] == 'waiting_schedule':
+                upload_val = 0 # Masih menunggu
+
+            # === TAMPILKAN DI UI ===
+            st.markdown("#### 📊 Processing Steps")
+            
+            col_render, col_upload = st.columns(2)
+            
+            with col_render:
+                st.write("**1. Rendering**")
+                st.progress(render_val)
+                if render_val == 100: st.success("✅ Render Complete")
+                elif job['status_render'] == 'rendering': st.info(f"⚙️ Rendering... {render_val}%")
+                elif job['status_render'] == 'failed': st.error("❌ Render Failed")
+                else: st.caption("Waiting...")
+
+            with col_upload:
+                st.write("**2. Uploading**")
+                st.progress(upload_val)
+                if upload_val == 100: st.success("✅ Upload Complete")
+                elif job['status_upload'] == 'uploading': st.info(f"☁️ Uploading... {upload_val}%")
+                elif job['status_upload'] == 'waiting_schedule': st.warning("⏳ Waiting Schedule")
+                else: st.caption("Waiting...")
+
+            # Info ETA (Hanya muncul jika sedang render)
+            if job['status_render'] == 'rendering':
+                 st.caption(f"⏱️ **Estimasi Selesai Render:** {job['eta_text']}")
+
+            st.divider()
+
+            c1, c2, c3 = st.columns([1, 1, 1])
+            with c1:
+                st.write("**File Info**")
                 if os.path.exists(job['video_path']):
                     if st.button("📂 Source Video", key=f"v_{sel_id}"): open_local_folder(job['video_path'])
-                if os.path.exists(job['audio_path']):
-                    if st.button("📂 Source Audio", key=f"a_{sel_id}"): open_local_folder(job['audio_path'])
                 
-                st.markdown("---")
-                if r_status == 'success' and job['output_path'] and os.path.exists(job['output_path']):
-                    st.write("**Output Result:**")
+                if job['output_path'] and os.path.exists(job['output_path']):
+                    st.success("Output Available")
                     st.video(job['output_path'])
-                    if st.button(f"📂 Open Output Folder", key=f"o_{sel_id}"): open_local_folder(job['output_path'])
+                    if st.button("📂 Open Output Folder", key=f"o_{sel_id}"): open_local_folder(job['output_path'])
 
             with c2:
-                st.write("📋 **Metadata**")
-                st.text_input("Title", value=job['title'], key=f"t_{sel_id}")
-                st.text_area("Description", value=job['description'], height=150, key=f"d_{sel_id}")
-                st.text_area("Tags", value=job['tags'], key=f"tg_{sel_id}")
+                st.write("**Metadata**")
+                st.text_input("Title", value=job['title'], key=f"t_{sel_id}", disabled=True)
+                st.text_area("Desc", value=job['description'], height=100, key=f"d_{sel_id}", disabled=True)
                 
             with c3:
-                st.write("📝 **Logs**")
-                st.text_area("Logs", value=job['logs'], height=350, key=f"l_{sel_id}", disabled=True)
+                st.write("**System Logs**")
+                st.text_area("Logs", value=job['logs'], height=300, key=f"l_{sel_id}", disabled=True)
     else:
-        st.info("No jobs yet.")
+        st.info("No jobs found.")
 
 def main():
-    st.title("📹 ASMR Engine V7 (Stable Time Picker)")
+    st.title("📹 ASMR Engine V7 Pro")
     t1, t2 = st.tabs(["Create", "Manage"])
     with t1: ui_upload_tab()
     with t2: ui_manager_tab()
