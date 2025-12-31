@@ -372,7 +372,19 @@ def ui_upload_tab():
     with col1:
         st.subheader("Media & Edit")
         uploaded_video = st.file_uploader("Video Loop (MP4)", type=['mp4', 'mov'])
+        
+        # --- FEATURE 1: PREVIEW VIDEO ---
+        if uploaded_video:
+            with st.expander("👁️ Preview Source Video"):
+                st.video(uploaded_video)
+
         uploaded_audio = st.file_uploader("Audio Track (MP3/WAV)", type=['mp3', 'wav', 'aac'])
+        
+        # --- FEATURE 2: PREVIEW AUDIO ---
+        if uploaded_audio:
+            with st.expander("👂 Preview Source Audio"):
+                st.audio(uploaded_audio)
+        
         st.markdown("---")
         
         watermark_mode = st.selectbox(
@@ -514,7 +526,24 @@ def ui_manager_tab():
                 if job['output_path'] and os.path.exists(job['output_path']):
                     st.success("Output Available")
                     st.video(job['output_path'])
-                    if st.button("📂 Open Output Folder", key=f"o_{sel_id}"): open_local_folder(job['output_path'])
+                    
+                    col_open, col_down = st.columns(2)
+                    with col_open:
+                         if st.button("📂 Open Folder", key=f"o_{sel_id}"): open_local_folder(job['output_path'])
+                    
+                    # --- FEATURE 3: DOWNLOAD BUTTON ---
+                    with col_down:
+                        try:
+                            with open(job['output_path'], "rb") as file:
+                                btn = st.download_button(
+                                    label="⬇️ Download Video",
+                                    data=file,
+                                    file_name=os.path.basename(job['output_path']),
+                                    mime="video/mp4",
+                                    key=f"dl_{sel_id}"
+                                )
+                        except Exception as e:
+                            st.error("File not ready.")
 
             with c2:
                 st.write("**Metadata**")
